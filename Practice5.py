@@ -1,9 +1,3 @@
-# Practice5.py: DNS scan + registration date + SSL + website check, then a SAFE / UNSAFE verdict for each domain.
-# Run:  python Practice5.py sjiblbd.com            scan this domain
-#       python Practice5.py sjiblbd.com --limit 30  quick test, only the first 30 variations
-#       python Practice5.py                         scan the default domain set below (name / tld)
-# Needs (same folder): Practice2.py, baseline.py, webcheck.py, rdap.py, verdict.py
-# Install once:  pip install dnspython
 import argparse
 import os
 import re
