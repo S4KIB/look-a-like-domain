@@ -1,5 +1,12 @@
+# Practice5.py: DNS scan + registration date + SSL + website check, then a SAFE / UNSAFE verdict for each domain.
+# Run:  python Practice5.py sjiblbd.com            scan this domain
+#       python Practice5.py sjiblbd.com --limit 30  quick test, only the first 30 variations
+#       python Practice5.py                         scan the default domain set below (name / tld)
+# Needs (same folder): Practice2.py, baseline.py, webcheck.py, rdap.py, verdict.py
+# Install once:  pip install dnspython
 import argparse
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -19,11 +26,11 @@ from Practice10 import judge
 from Practice7 import check_web
 
 
-name = ""
-tld = ""
+name = "sjiblbd"
+tld = "com"
 
 # The company's own domains. They are not threats, so they are skipped.
-OFFICIAL = {"sjiblbd.com",  name + "." + tld}
+OFFICIAL = {"sjiblbd.com", "sjibl-bd.com", name + "." + tld}
 
 # How many variations to check. None = all of them. For a quick test use:  python Practice5.py domain.com --limit 30
 LIMIT = None
@@ -87,6 +94,34 @@ def get_records(domain, rtype):
         return []
 
 
+def txt_text(record):
+    """A TXT record comes as '"part one" "part two"'. Join the parts into one string."""
+    parts = re.findall(r'"([^"]*)"', record)
+    return "".join(parts) if parts else record.strip('"')
+
+
+def get_mail_policy(domain):
+    """
+    Email set-up of a domain (only DNS questions, no connection to the domain):
+      SPF   = TXT record that lists the servers allowed to send email for the domain
+      DMARC = TXT record at _dmarc.domain that says what to do with email that fails the checks
+    Returns (spf_text, dmarc_text), an empty string when there is none.
+    """
+    spf = ""
+    for t in get_records(domain, "TXT") or []:
+        value = txt_text(t)
+        if value.lower().startswith("v=spf1"):
+            spf = value
+            break
+    dmarc = ""
+    for t in get_records("_dmarc." + domain, "TXT") or []:
+        value = txt_text(t)
+        if value.lower().startswith("v=dmarc1"):
+            dmarc = value
+            break
+    return spf, dmarc
+
+
 def check(domain):
     a = get_records(domain, "A")
     if a is None:
@@ -96,7 +131,8 @@ def check(domain):
     ns = get_records(domain, "NS") or []
     if not (a or mx or ns):
         return None
-    return {"domain": domain, "a": a, "mx": mx, "ns": ns, "risk": ""}
+    spf, dmarc = get_mail_policy(domain)
+    return {"domain": domain, "a": a, "mx": mx, "ns": ns, "spf": spf, "dmarc": dmarc, "risk": ""}
 
 
 # =====================================================================
@@ -186,6 +222,39 @@ def web_cell(h):
     return web
 
 
+def spf_allows_sending(spf):
+    """False for an empty SPF and for 'v=spf1 -all' (a record that says: nobody may send email)."""
+    for token in spf.lower().split()[1:]:
+        t = token.lstrip("+-~?")
+        if t.startswith(("include:", "ip4:", "ip6:", "exists:", "redirect=")) or t in ("a", "mx", "ptr") \
+                or t.startswith(("a:", "a/", "mx:", "mx/")):
+            return True
+    return False
+
+
+def mail_setup(h):
+    """MX + SPF + DMARC in a few characters. The more of them, the better prepared the domain is to send email."""
+    parts = []
+    if h.get("mx"):
+        parts.append("MX")
+    if h.get("spf"):
+        parts.append("SPF" if spf_allows_sending(h["spf"]) else "SPF(deny)")
+    if h.get("dmarc"):
+        parts.append("DMARC")
+    return "+".join(parts) if parts else "-"
+
+
+def dmarc_policy(dmarc):
+    m = re.search(r"\bp=(\w+)", dmarc or "", re.I)
+    return m.group(1).lower() if m else "-"
+
+
+def spf_ending(spf):
+    """-all = reject others, ~all = soft fail, ?all = neutral, +all = allow everyone"""
+    m = re.search(r"([-~?+]?all)\b", spf or "")
+    return m.group(1) if m else "-"
+
+
 def print_report(hits, target, total, seconds, first_run, new_count, errors):
     color = sys.stdout.isatty()
     width = shutil.get_terminal_size((120, 20)).columns - 4     # small safety margin so lines never wrap
@@ -199,6 +268,7 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
             "AGE": age_short(h.get("age_days")),
             "SSL": ssl_short(h),
             "WEB": web_cell(h),
+            "MAIL SETUP": mail_setup(h),
             "IP": with_more(h["a"][0], len(h["a"]), 999) if h["a"] else "-",
             "NAME SERVER": with_more(h["ns"][0].strip("."), len(h["ns"]), 999) if h["ns"] else "-",
             "MAIL SERVER": with_more(first_mx(h["mx"]), len(h["mx"]), 999) if h["mx"] else "-",
@@ -216,7 +286,7 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
         wanted.append("SSL")
     if ENABLE_WEB_CHECK:
         wanted.append("WEB")
-    wanted += ["IP", "NAME SERVER", "MAIL SERVER", "TECHNIQUE"]
+    wanted += ["MAIL SETUP", "IP", "NAME SERVER", "MAIL SERVER", "TECHNIQUE"]
 
     MAX_W = 60   # only a really long value is cut at this width
     widths = {t: min(MAX_W, max([len(t)] + [len(v[t]) for v in all_values]) + 2) for t in wanted}
@@ -242,9 +312,13 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
     print(f" Scan time   : {datetime.now():%Y-%m-%d %H:%M}    Duration: {seconds:.1f} s")
     print(f" Checked     : {total}    Registered: {len(hits)}    "
           f"NEW: {paint(str(new_count), 'NEW', color) if new_count else 0}")
+    ready = sum(1 for h in hits if h.get("mx") and spf_allows_sending(h.get("spf", "")))
+    full = sum(1 for h in hits if h.get("mx") and spf_allows_sending(h.get("spf", "")) and h.get("dmarc"))
     used_checks = ["DNS"] + [n for n, on in (("RDAP", ENABLE_RDAP), ("SSL", ENABLE_SSL_CHECK),
                                              ("Website", ENABLE_WEB_CHECK)) if on]
     print(f" Clues used  : {', '.join(used_checks)}")
+    print(f" Email ready : {ready} of {len(hits)} domains have MX + SPF (can receive and send email), "
+          f"{full} also have DMARC")
     if first_run:
         print(paint(" First run: all hits saved as the baseline. NEW hits appear from the next run.", "DIM", color))
     print(thin)
@@ -331,6 +405,8 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
             line("IP", ", ".join(h["a"]) or "-")
             line("MAIL", ", ".join(h["mx"]) or "-")
             line("NAME SERVER", ", ".join(n.strip(".") for n in h["ns"]) or "-")
+            line("SPF", f"{h['spf']}   (ending: {spf_ending(h['spf'])})" if h.get("spf") else "none")
+            line("DMARC", f"{h['dmarc']}   (policy: {dmarc_policy(h['dmarc'])})" if h.get("dmarc") else "none")
             if ENABLE_WEB_CHECK:
                 line("WEBSITE", h.get("web", "-"))
             if ENABLE_SSL_CHECK:
@@ -346,6 +422,9 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
                      if age is not None else "no RDAP data")
         print(thin)
 
+    print(" MAIL SETUP = MX (receives email) + SPF (lists servers allowed to send) + DMARC (policy for failed checks).")
+    print("              SPF(deny) = the record allows nobody to send. MX + SPF together suggest the domain is set up to")
+    print("              send and receive email, which phishing emails need. It is a clue, not proof.")
     print(" AGE = time since registration (d = days, m = months, y = years, n/a = no RDAP data).")
     print(" SAFE = no strong danger signs found. It does NOT prove a site is safe.")
     print(" UNSAFE = several danger signs together. Analyst review is needed for every hit.")
