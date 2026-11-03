@@ -586,3 +586,4 @@ if __name__ == "__main__":
 
     print_report(hits, f"{name}.{tld}", checked, time.time() - start,
                  first_run, len(new), error_counts)
+
