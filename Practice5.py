@@ -357,10 +357,7 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
             row += cell
         print(row.rstrip())
     print(thin)
-    if hidden:
-        print(f" Hidden because the terminal is too narrow: {', '.join(hidden)}. "
-              f"Make the terminal wider, or see FULL DETAILS below.")
-        print(thin)
+    
 
     # ---------- Where the redirects go ----------
     redirects = [h for h in hits if h.get("redirect_to")]
