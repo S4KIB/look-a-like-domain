@@ -14,17 +14,17 @@ import dns.resolver
 
 from Practice3 import generate_variants
 import feeds
+import services
 from Practice6 import find_new
 from Practice9 import rdap_lookup, ssl_lookup
 from Practice10 import judge
 from Practice7 import check_web
 
-
 name = "sjiblbd"
 tld = "com"
 
 # The company's own domains. They are not threats, so they are skipped.
-OFFICIAL = {"sjiblbd.com", "sjibl-bd.com", name + "." + tld}
+OFFICIAL = {"sjiblbd.com", "sjibl-bd.com.bd", name + "." + tld}
 
 # How many variations to check. None = all of them. For a quick test use:  python Practice5.py domain.com --limit 30
 LIMIT = None
@@ -32,10 +32,6 @@ LIMIT = None
 # DNS servers to ask. [] = use the computer's default.
 DNS_SERVERS = ["8.8.8.8", "1.1.1.1"]
 
-# ---- Extra checks that give the verdict its clues ----
-# These two CONTACT the remote domain's server (they can see your IP address).
-# Use them only on your personal laptop with public practice domains.
-# NEVER enable them on a bank network without written approval.
 ENABLE_WEB_CHECK = True    # is a website live? (HTTP headers only, see webcheck.py)
 ENABLE_SSL_CHECK = True    # SSL certificate (TLS handshake only, see rdap.py)
 
@@ -55,6 +51,11 @@ SAFE_FILE = os.path.join(HERE, "data", "safe_domains.txt")       # always shown 
 
 # Print every IP, mail server, name server and the full redirect target for each domain, nothing cut off.
 SHOW_FULL_DETAILS = True
+
+ENABLE_SERVICES = True       # which names (www, mail, login, vpn ...) exist under each domain
+ENABLE_CT_SERVICES = True    # also ask crt.sh which names got an SSL certificate (a free public service)
+SERVICES_MAX = 40            # look at most this many domains per run (UNSAFE ones first)
+CT_DELAY = 1.0               # seconds between crt.sh requests
 
 # Collects DNS errors (timeouts etc.) so they are not hidden
 errors = []
@@ -99,21 +100,17 @@ def get_mail_policy(domain):
     Email set-up of a domain (only DNS questions, no connection to the domain):
       SPF   = TXT record that lists the servers allowed to send email for the domain
       DMARC = TXT record at _dmarc.domain that says what to do with email that fails the checks
-    Returns (spf_text, dmarc_text), an empty string when there is none.
+    Returns (spf_text, dmarc_text, all_txt_records). A text is empty when there is none.
     """
-    spf = ""
-    for t in get_records(domain, "TXT") or []:
-        value = txt_text(t)
-        if value.lower().startswith("v=spf1"):
-            spf = value
-            break
+    txt = [txt_text(t) for t in get_records(domain, "TXT") or []]
+    spf = next((v for v in txt if v.lower().startswith("v=spf1")), "")
     dmarc = ""
     for t in get_records("_dmarc." + domain, "TXT") or []:
         value = txt_text(t)
         if value.lower().startswith("v=dmarc1"):
             dmarc = value
             break
-    return spf, dmarc
+    return spf, dmarc, txt
 
 
 def check(domain):
@@ -125,8 +122,8 @@ def check(domain):
     ns = get_records(domain, "NS") or []
     if not (a or mx or ns):
         return None
-    spf, dmarc = get_mail_policy(domain)
-    return {"domain": domain, "a": a, "mx": mx, "ns": ns, "spf": spf, "dmarc": dmarc, "risk": ""}
+    spf, dmarc, txt = get_mail_policy(domain)
+    return {"domain": domain, "a": a, "mx": mx, "ns": ns, "spf": spf, "dmarc": dmarc, "txt": txt, "risk": ""}
 
 
 # =====================================================================
@@ -249,6 +246,16 @@ def spf_ending(spf):
     return m.group(1) if m else "-"
 
 
+def services_cell(h):
+    """SERVICES column: how many service names were found. (!) = login / payment / admin / remote names."""
+    sv = h.get("services")
+    if not sv:
+        return "-"
+    if sv["wildcard"] and sv["total"] == 0:
+        return "wildcard DNS"
+    return f"{sv['total']}" + (" (!)" if sv["sensitive"] else "")
+
+
 def print_report(hits, target, total, seconds, first_run, new_count, errors):
     color = sys.stdout.isatty()
     width = shutil.get_terminal_size((120, 20)).columns - 4     # small safety margin so lines never wrap
@@ -263,6 +270,7 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
             "SSL": ssl_short(h),
             "WEB": web_cell(h),
             "MAIL SETUP": mail_setup(h),
+            "SERVICES": services_cell(h),
             "IP": with_more(h["a"][0], len(h["a"]), 999) if h["a"] else "-",
             "NAME SERVER": with_more(h["ns"][0].strip("."), len(h["ns"]), 999) if h["ns"] else "-",
             "MAIL SERVER": with_more(first_mx(h["mx"]), len(h["mx"]), 999) if h["mx"] else "-",
@@ -280,7 +288,10 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
         wanted.append("SSL")
     if ENABLE_WEB_CHECK:
         wanted.append("WEB")
-    wanted += ["MAIL SETUP", "IP", "NAME SERVER", "MAIL SERVER", "TECHNIQUE"]
+    wanted.append("MAIL SETUP")
+    if ENABLE_SERVICES:
+        wanted.append("SERVICES")
+    wanted += ["IP", "NAME SERVER", "MAIL SERVER", "TECHNIQUE"]
 
     MAX_W = 60   # only a really long value is cut at this width
     widths = {t: min(MAX_W, max([len(t)] + [len(v[t]) for v in all_values]) + 2) for t in wanted}
@@ -313,6 +324,10 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
     print(f" Clues used  : {', '.join(used_checks)}")
     print(f" Email ready : {ready} of {len(hits)} domains have MX + SPF (can receive and send email), "
           f"{full} also have DMARC")
+    if ENABLE_SERVICES:
+        looked = [h for h in hits if h.get("services")]
+        sens = sum(1 for h in looked if h["services"]["sensitive"])
+        print(f" Services    : looked at {len(looked)} domains, {sens} have login / payment / admin / remote names")
     if first_run:
         print(paint(" First run: all hits saved as the baseline. NEW hits appear from the next run.", "DIM", color))
     print(thin)
@@ -331,10 +346,10 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
 
     # ---------- Summary with bars ----------
     print(" RISK SUMMARY")
-    biggest = max(len(unsafe), len(safe)) or 1
+    total_hits = len(hits) or 1
     for label, group in (("UNSAFE", unsafe), ("SAFE", safe)):
-        n = round(len(group) / biggest * 30)
-        print(f"   {paint(f'{label:<7}', label, color)} {paint('#' * n, label, color)}{' ' * (30 - n)} {len(group)}")
+        pct = len(group) / total_hits * 100
+        print(f"   {paint(f'{label:<7}', label, color)} {paint('-' * 30, label, color)} {len(group)} ({pct:.0f}%)")
     print(thin)
 
     mail = [base(first_mx(h["mx"])) for h in hits if h["mx"]]
@@ -362,7 +377,7 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
     # ---------- Where the redirects go ----------
     redirects = [h for h in hits if h.get("redirect_to")]
     if redirects:
-        print(paint(" WHERE THE REDIRECTS GO (the tool does not follow them, it only reads the first answer)", "BOLD", color))
+        print(paint(" WHERE THE REDIRECTS GO ", "BOLD", color))
         for h in sorted(redirects, key=lambda h: redirect_kind(h["domain"], h["redirect_to"])):
             print(f"   {h['domain']:<26} -> {h['redirect_to']:<30} {redirect_kind(h['domain'], h['redirect_to'])}")
         print(thin)
@@ -384,13 +399,51 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
                 print(f"       {r}")
         print(thin)
 
+    # ---------- Public services under each domain ----------
+    if ENABLE_SERVICES and any(h.get("services") for h in hits):
+        def sline(label, text):
+            print(textwrap.fill(f"{label:<16}: {text}", width=max(width, 60), initial_indent="     ",
+                                subsequent_indent=" " * 23, break_long_words=False, break_on_hyphens=False))
+
+        print(paint(" PUBLIC SERVICES UNDER EACH DOMAIN ",
+                    "BOLD", color))
+        order = list(services.CATEGORIES) + ["Other"]
+        for h in hits:
+            print(f" {paint(h['domain'], h['risk'], color)}   [{h['risk']}]")
+            sv = h.get("services")
+            if not sv:
+                print("     not checked (more domains than SERVICES_MAX)")
+                continue
+            if sv["wildcard"]:
+                print("     wildcard DNS: every name resolves, so services cannot be listed by name")
+            if not sv["by_category"] and not sv["wildcard"]:
+                print("     no common service names found")
+            for cat in order:
+                if cat in sv["by_category"]:
+                    names = ", ".join(f"{n} [{src}]" for n, src in sv["by_category"][cat])
+                    flag = "   <-- sensitive" if cat in services.SENSITIVE else ""
+                    sline(cat, names + flag)
+            if sv["email_provider"]:
+                sline("Email provider", sv["email_provider"])
+            if sv["dns_provider"]:
+                sline("DNS provider", sv["dns_provider"])
+            if sv["signs"]:
+                sline("Other signs", ", ".join(sv["signs"]) + " (from TXT records)")
+            if ENABLE_CT_SERVICES:
+                cert_names = sum(1 for items in sv["by_category"].values() for _, src in items if "cert" in src)
+                if sv["ct_status"] in ("ok", "cached"):
+                    sline("Certificates", f"crt.sh lists {cert_names} names under this domain")
+                else:
+                    sline("Certificates", f"crt.sh not used ({sv['ct_status']})")
+        print(thin)
+
     # ---------- Full details: every value, nothing cut off ----------
     if SHOW_FULL_DETAILS:
         def line(label, text):
             print(textwrap.fill(f"{label:<11}: {text}", width=max(width, 60), initial_indent="     ",
                                 subsequent_indent=" " * 18, break_long_words=False, break_on_hyphens=False))
 
-        print(paint(" FULL DETAILS (nothing is cut off)", "BOLD", color))
+        print(paint(" FULL DETAILS ", "BOLD", color))
         for h in hits:
             print(f" {paint(h['domain'], h['risk'], color)}   [{h['risk']}, {h['status']}]   technique: {h['technique']}")
             line("IP", ", ".join(h["a"]) or "-")
@@ -416,6 +469,7 @@ def print_report(hits, target, total, seconds, first_run, new_count, errors):
     print(" MAIL SETUP = MX (receives email) + SPF (lists servers allowed to send) + DMARC (policy for failed checks).")
     print("              SPF(deny) = the record allows nobody to send. MX + SPF together suggest the domain is set up to")
     print("              send and receive email, which phishing emails need. It is a clue, not proof.")
+    print(" SERVICES = number of service names found under the domain. (!) = login / payment / admin / remote names.")
     print(" AGE = time since registration (d = days, m = months, y = years, n/a = no RDAP data).")
     print(" SAFE = no strong danger signs found. It does NOT prove a site is safe.")
     print(" UNSAFE = several danger signs together. Analyst review is needed for every hit.")
@@ -505,6 +559,32 @@ def apply_lists(hits):
             print(f"  {label}: file NOT found ({path})")
 
 
+def add_services(hits):
+    """Find which public services seem to exist under each domain (names in DNS, names in certificates)."""
+    if not ENABLE_SERVICES or not hits:
+        return
+    todo = hits[:SERVICES_MAX]
+    mode = "DNS names + crt.sh certificates" if ENABLE_CT_SERVICES else "DNS names"
+    print(f"Public services under {len(todo)} registered domains ({mode})...")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        probes = list(ex.map(lambda h: services.probe_names(h["domain"], get_records), todo))
+
+    ct_failures = 0
+    for h, (wildcard, found) in zip(todo, probes):
+        ct_names, ct_status = set(), "off"
+        if ENABLE_CT_SERVICES:
+            if ct_failures >= 3:
+                ct_status = "skipped, crt.sh did not answer"
+            else:
+                ct_names, ct_status = services.ct_subdomains(h["domain"])
+                if ct_status.startswith("error"):
+                    ct_failures += 1
+                elif ct_status == "ok":
+                    ct_failures = 0
+                    time.sleep(CT_DELAY)
+        h["services"] = services.summarize(h, wildcard, found, ct_names, ct_status)
+
+
 def add_clues(hits):
     """Collect the extra clues for every hit: registration date, SSL certificate, website."""
     # 1. Registration date and registrar (public registry, one by one because of rate limits)
@@ -577,10 +657,11 @@ if __name__ == "__main__":
     # NEW first, then UNSAFE before SAFE, highest score first
     hits.sort(key=lambda h: (h["status"] != "NEW", h["risk"] != "UNSAFE", -h["score"], h["domain"]))
 
+    add_services(hits)          # after sorting, so UNSAFE domains come first when there is a limit
+
     error_counts = {}
     for e in errors:
         error_counts[e] = error_counts.get(e, 0) + 1
 
     print_report(hits, f"{name}.{tld}", checked, time.time() - start,
                  first_run, len(new), error_counts)
-
